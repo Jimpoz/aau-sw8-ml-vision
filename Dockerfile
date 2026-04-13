@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps for image decoding
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY serving/ /app/serving/
+COPY models/ /app/models/
+
+ENV PORT=8000 \
+    MODEL_DIR=/app/models \
+    NEO4J_URI="" \
+    NEO4J_USER="" \
+    NEO4J_PASSWORD="" \
+    LOG_LEVEL=info
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s \
+  CMD python -c "import requests; print(requests.get('http://127.0.0.1:8000/health', timeout=2).status_code)" || exit 1
+
+CMD ["uvicorn", "serving.main:app", "--host=0.0.0.0", "--port=8000"]

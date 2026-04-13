@@ -1,0 +1,17 @@
+{
+  "facility_id": "example_facility_id",
+  "trained_weights": "path/to/trained/best.pt",
+  "input_size": 640,
+  "class_names": [
+    "room",
+    "landmark"
+  ],
+  "export": {
+    "onnx": {
+      "dst": "models/example_facility_id/yolo26_indoor.onnx",
+      "src": "ultralytics_export_output/..."
+    }
+  },
+  "errors": {}
+}
+
