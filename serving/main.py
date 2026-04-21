@@ -1,19 +1,41 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
-import time
-from functools import lru_cache
 import shutil
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from serving.detector import Detection, Detector
 from serving.location_resolver import LocationEntity, LocationResolver, RouteStep
+
+_stream_executor = ThreadPoolExecutor(max_workers=2)
+
+
+class StreamDetection(BaseModel):
+    """Detection in Vision coordinate format for the iOS/Android live stream."""
+    label: str
+    confidence: float
+    x: float = Field(description="Normalised left edge (0–1, left origin)")
+    y: float = Field(description="Normalised bottom edge in Vision coords (0–1, bottom origin)")
+    width: float = Field(description="Normalised width")
+    height: float = Field(description="Normalised height")
+
+
+class StreamFrame(BaseModel):
+    detections: List[StreamDetection]
+    location: LocationEntity
 
 
 class DetectionDTO(BaseModel):
@@ -68,6 +90,64 @@ app.add_middleware(
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+def _process_stream_frame(facility_id: str, image_bytes: bytes) -> dict:
+    """Run inference + location resolution on a single frame. Runs in thread pool."""
+    try:
+        detector = _get_detector(facility_id)
+    except FileNotFoundError as exc:
+        return {"error": str(exc), "detections": [], "location": LocationEntity(kind="unknown", id="unknown", name="unknown").model_dump()}
+
+    detections_raw, _ = detector.infer(image_bytes)
+
+    img = Image.open(BytesIO(image_bytes))
+    orig_w, orig_h = img.size
+
+    stream_detections = []
+    for d in detections_raw:
+        x1, y1, x2, y2 = d.bbox_xyxy
+        x1_n = x1 / orig_w
+        y2_n = y2 / orig_h
+        stream_detections.append({
+            "label": d.label,
+            "confidence": round(d.confidence, 3),
+            "x": round(x1_n, 4),
+            "y": round(1.0 - y2_n, 4),          
+            "width": round((x2 - x1) / orig_w, 4),
+            "height": round((y2 - y1) / orig_h, 4),
+        })
+
+    resolved = _resolver.resolve(facility_id=facility_id, detections=detections_raw)
+    return {
+        "detections": stream_detections,
+        "location": resolved.current_location.model_dump(),
+    }
+
+
+@app.websocket("/ws/stream/{facility_id}")
+async def stream_vision(websocket: WebSocket, facility_id: str):
+    """
+    Live camera feed endpoint.
+    iOS/Android sends JPEG frames as binary messages.
+    Server responds with a StreamFrame JSON per frame:
+      { detections: [...], location: {...} }
+    """
+    await websocket.accept()
+    loop = asyncio.get_event_loop()
+    try:
+        while True:
+            image_bytes = await websocket.receive_bytes()
+            if not image_bytes:
+                continue
+            frame_result = await loop.run_in_executor(
+                _stream_executor, _process_stream_frame, facility_id, image_bytes
+            )
+            await websocket.send_text(json.dumps(frame_result))
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[stream_vision:{facility_id}] error: {exc}")
 
 
 @app.get("/v1/models/{facility_id}")
