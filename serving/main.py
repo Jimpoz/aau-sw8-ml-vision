@@ -123,11 +123,22 @@ def _process_stream_frame(facility_id: str, image_bytes: bytes) -> dict:
     )
     if orb_result is not None:
         loc = orb_result.current_location
+        bbox = (loc.properties or {}).get("bbox_norm")
+        if bbox and len(bbox) == 4:
+            x1, y1, x2, y2 = bbox
+            box = {
+                "x": round(x1, 4),
+                "y": round(1.0 - y2, 4),
+                "width": round(x2 - x1, 4),
+                "height": round(y2 - y1, 4),
+            }
+        else:
+            box = {"x": 0.20, "y": 0.20, "width": 0.60, "height": 0.60}
         return {
             "detections": [{
                 "label": "landmark",
                 "confidence": loc.confidence,
-                "x": 0.20, "y": 0.20, "width": 0.60, "height": 0.60,
+                **box,
                 "is_landmark_match": True,
                 "landmark_name": loc.name,
             }],

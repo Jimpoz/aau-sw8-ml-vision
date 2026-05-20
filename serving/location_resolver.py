@@ -266,6 +266,7 @@ class LocationResolver:
                 "landmark_id": lm.id,
                 "good_matches": match.good_matches,
                 "elapsed_ms": match.elapsed_ms,
+                "bbox_norm": list(match.bbox_norm) if match.bbox_norm else None,
             },
         )
         return ResolvedLocation(

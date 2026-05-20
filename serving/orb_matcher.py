@@ -5,7 +5,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 def _env_float(name: str, default: float) -> float:
@@ -27,6 +27,10 @@ _RATIO_TEST = _env_float("ORB_RATIO_TEST", 0.75)
 _MIN_GOOD_MATCHES = _env_int("ORB_MIN_GOOD_MATCHES", 8)
 
 _ORB_FEATURES = _env_int("ORB_FEATURES", 1000)
+
+_MIN_INLIERS = _env_int("ORB_MIN_INLIERS", 12)
+
+_RANSAC_REPROJ_PX = _env_float("ORB_RANSAC_REPROJ_PX", 5.0)
 
 
 def _try_import_cv2():
@@ -157,6 +161,7 @@ class CachedLandmark:
     campus_id: Optional[str]
     descriptors: Any  # numpy.ndarray
     keypoint_count: int
+    keypoints: Any = None  # numpy.ndarray (N, 2)
 
 
 @dataclass
@@ -166,6 +171,7 @@ class OrbMatch:
     landmark: CachedLandmark
     good_matches: int
     elapsed_ms: float
+    bbox_norm: Optional[Tuple[float, float, float, float]] = None
     debug: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -221,6 +227,7 @@ class OrbLandmarkMatcher:
                 print(f"[orb_matcher] landmark {record.get('id')!r} produced no descriptors", flush=True)
                 continue
 
+            ref_pts = _np.float32([kp.pt for kp in keypoints]) if keypoints else None
             out.append(CachedLandmark(
                 id=str(record["id"]),
                 name=str(record.get("name") or record["id"]),
@@ -229,6 +236,7 @@ class OrbLandmarkMatcher:
                 campus_id=record.get("campus_id"),
                 descriptors=descriptors,
                 keypoint_count=len(keypoints),
+                keypoints=ref_pts,
             ))
 
         print(
@@ -271,7 +279,7 @@ class OrbLandmarkMatcher:
             if frame is None:
                 return None
             orb = _cv2.ORB_create(nfeatures=_ORB_FEATURES)
-            _, frame_descriptors = orb.detectAndCompute(frame, None)
+            frame_keypoints, frame_descriptors = orb.detectAndCompute(frame, None)
         except Exception as exc:
             print(f"[orb_matcher] frame extraction failed: {exc}", flush=True)
             return None
@@ -279,9 +287,12 @@ class OrbLandmarkMatcher:
         if frame_descriptors is None or len(frame_descriptors) == 0:
             return None
 
+        frame_h, frame_w = frame.shape[:2]
+
         bf = _cv2.BFMatcher(_cv2.NORM_HAMMING, crossCheck=False)
         best: Optional[CachedLandmark] = None
         best_score = 0
+        best_good: List[Any] = []  # cv2.DMatch list for the winner
         per_landmark_scores: Dict[str, int] = {}
 
         for entry in entries:
@@ -289,44 +300,102 @@ class OrbLandmarkMatcher:
                 pairs = bf.knnMatch(frame_descriptors, entry.descriptors, k=2)
             except Exception:
                 continue
-            good = 0
+            good: List[Any] = []
             for pair in pairs:
                 if len(pair) < 2:
                     continue
                 m, n = pair
                 if m.distance < _RATIO_TEST * n.distance:
-                    good += 1
-            per_landmark_scores[entry.id] = good
-            if good > best_score:
-                best_score = good
+                    good.append(m)
+            per_landmark_scores[entry.id] = len(good)
+            if len(good) > best_score:
+                best_score = len(good)
                 best = entry
+                best_good = good
 
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
         if best is None or best_score < _MIN_GOOD_MATCHES:
             if best is not None and best_score > 0 and best_score % 3 == 0:
                 print(
                     f"[orb_matcher] near-miss facility={facility_id!r} "
-                    f"best={best.name!r}@{best.space_id} score={best_score} "
-                    f"threshold={_MIN_GOOD_MATCHES} "
+                    f"best={best.name!r}@{best.space_id} good={best_score} "
+                    f"min_good={_MIN_GOOD_MATCHES} "
                     f"frame_kp={len(frame_descriptors)} "
                     f"all_scores={per_landmark_scores}",
                     flush=True,
                 )
             return None
+
+        inliers = 0
+        inlier_pts: List[Any] = []
+        if best.keypoints is not None and len(best_good) >= 4:
+            try:
+                src = _np.float32(
+                    [best.keypoints[m.trainIdx] for m in best_good
+                     if m.trainIdx < len(best.keypoints)]
+                ).reshape(-1, 1, 2)
+                dst = _np.float32(
+                    [frame_keypoints[m.queryIdx].pt for m in best_good
+                     if m.queryIdx < len(frame_keypoints)]
+                ).reshape(-1, 1, 2)
+                if len(src) >= 4 and len(src) == len(dst):
+                    _h, mask = _cv2.findHomography(
+                        src, dst, _cv2.RANSAC, _RANSAC_REPROJ_PX
+                    )
+                    if mask is not None:
+                        inliers = int(mask.sum())
+                        inlier_pts = [dst[i][0] for i in range(len(dst)) if mask[i][0]]
+            except Exception as exc:
+                print(f"[orb_matcher] homography failed: {exc}", flush=True)
+                inliers = 0
+        else:
+            inliers = best_score
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if inliers < _MIN_INLIERS:
+            print(
+                f"[orb_matcher] rejected facility={facility_id!r} "
+                f"best={best.name!r}@{best.space_id} good={best_score} "
+                f"inliers={inliers} min_inliers={_MIN_INLIERS} (failed geometry check)",
+                flush=True,
+            )
+            return None
+
+        bbox_norm: Optional[Tuple[float, float, float, float]] = None
+        pts = inlier_pts or [
+            frame_keypoints[m.queryIdx].pt for m in best_good
+            if m.queryIdx < len(frame_keypoints)
+        ]
+        if pts and frame_w > 0 and frame_h > 0:
+            xs = [float(p[0]) for p in pts]
+            ys = [float(p[1]) for p in pts]
+            pad_x = (max(xs) - min(xs)) * 0.10 + 8.0
+            pad_y = (max(ys) - min(ys)) * 0.10 + 8.0
+            x1 = max(0.0, (min(xs) - pad_x) / frame_w)
+            y1 = max(0.0, (min(ys) - pad_y) / frame_h)
+            x2 = min(1.0, (max(xs) + pad_x) / frame_w)
+            y2 = min(1.0, (max(ys) + pad_y) / frame_h)
+            if x2 > x1 and y2 > y1:
+                bbox_norm = (x1, y1, x2, y2)
+
         print(
             f"[orb_matcher] HIT facility={facility_id!r} "
             f"landmark={best.name!r}@{best.space_id} "
-            f"score={best_score} elapsed_ms={elapsed_ms:.1f}",
+            f"good={best_score} inliers={inliers} "
+            f"elapsed_ms={elapsed_ms:.1f} bbox={bbox_norm}",
             flush=True,
         )
         return OrbMatch(
             landmark=best,
-            good_matches=best_score,
+            good_matches=inliers,
             elapsed_ms=elapsed_ms,
+            bbox_norm=bbox_norm,
             debug={
                 "frame_keypoints": int(len(frame_descriptors)),
+                "good_matches": best_score,
+                "inliers": inliers,
                 "per_landmark_scores": per_landmark_scores,
                 "ratio_test": _RATIO_TEST,
                 "min_good_matches": _MIN_GOOD_MATCHES,
+                "min_inliers": _MIN_INLIERS,
             },
         )
