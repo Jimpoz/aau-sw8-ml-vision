@@ -6,12 +6,27 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, Field
 
+from serving.landmarks_store import LandmarkStore
+from serving.orb_matcher import (
+    FallbackLandmarkSource,
+    Neo4jLandmarkSource,
+    OrbLandmarkMatcher,
+    OrbMatch,
+    PostgresLandmarkSource,
+)
+
 
 class LocationEntity(BaseModel):
     kind: str = Field(description="e.g. 'room', 'landmark', 'corridor'")
     id: str
     name: str
     confidence: float = 0.0
+    space_id: Optional[str] = None
+    building_id: Optional[str] = None
+    building_name: Optional[str] = None
+    campus_id: Optional[str] = None
+    floor_id: Optional[str] = None
+    floor_index: Optional[int] = None
     properties: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -55,6 +70,26 @@ class SpatialBackend:
                 self._neo4j_available = False
                 self._driver = None
 
+        self._landmark_store = LandmarkStore(neo4j_driver=self._driver)
+        self._orb_matcher = OrbLandmarkMatcher(
+            source=FallbackLandmarkSource([
+                Neo4jLandmarkSource(self._driver),
+                PostgresLandmarkSource(os.getenv("SUPABASE_DB_URL")),
+            ])
+        )
+
+    @property
+    def landmark_store(self) -> LandmarkStore:
+        """Expose the underlying store so the WS frame processor can
+        re-query for the supporting-detection indices that triggered
+        the resolver match — iOS uses those to draw the yellow overlay
+        around the same boxes the server localised against."""
+        return self._landmark_store
+
+    @property
+    def orb_matcher(self) -> OrbLandmarkMatcher:
+        return self._orb_matcher
+
     def close(self) -> None:
         if self._driver is not None:
             self._driver.close()
@@ -73,6 +108,35 @@ class SpatialBackend:
         - Otherwise use deterministic heuristics.
         """
         debug: Dict[str, Any] = {"neo4j_enabled": self._neo4j_available}
+
+        match = self._landmark_store.find_match(
+            facility_id=facility_id, detections=detections
+        )
+        if match is not None:
+            entry = match.entry
+            resolved_id = entry.resolved_space_id or entry.space_id_or_name
+            entity = LocationEntity(
+                kind="room",
+                id=resolved_id,
+                name=entry.display_name or entry.space_id_or_name,
+                confidence=match.confidence,
+                space_id=resolved_id,
+                building_id=entry.building_id,
+                building_name=entry.building_name,
+                campus_id=entry.campus_id,
+                floor_id=entry.floor_id,
+                floor_index=entry.floor_index,
+                properties={
+                    "match_label": entry.match.require_label,
+                    "match_min_confidence": entry.match.min_confidence,
+                    "supporting_detections": match.supporting_count,
+                },
+            )
+            return entity, {
+                **debug,
+                "resolution": "landmark_store",
+                "supporting_detections": match.supporting_count,
+            }
 
         if self._neo4j_available and self._driver is not None and len(detections) > 0:
             # NOTE: This query is intentionally a template because the Neo4j schema
@@ -165,6 +229,50 @@ class LocationResolver:
             neo4j_uri=os.getenv("NEO4J_URI", ""),
             neo4j_user=os.getenv("NEO4J_USER", ""),
             neo4j_password=os.getenv("NEO4J_PASSWORD", ""),
+        )
+
+    @property
+    def landmark_store(self):
+        return self._backend.landmark_store
+
+    @property
+    def orb_matcher(self):
+        return self._backend.orb_matcher
+
+    def resolve_from_image_bytes(
+        self,
+        *,
+        facility_id: str,
+        image_bytes: bytes,
+    ) -> Optional["ResolvedLocation"]:
+        """Top-priority match path: ORB against user-registered
+        Landmark nodes."""
+        match: Optional[OrbMatch] = self._backend.orb_matcher.match(
+            facility_id=facility_id, image_bytes=image_bytes
+        )
+        if match is None:
+            return None
+        lm = match.landmark
+        entity = LocationEntity(
+            kind="room",
+            id=lm.space_id,
+            name=lm.name,
+            confidence=min(1.0, match.good_matches / 60.0),
+            space_id=lm.space_id,
+            building_id=lm.building_id,
+            campus_id=lm.campus_id,
+            properties={
+                "match_strategy": "orb",
+                "landmark_id": lm.id,
+                "good_matches": match.good_matches,
+                "elapsed_ms": match.elapsed_ms,
+            },
+        )
+        return ResolvedLocation(
+            facility_id=facility_id,
+            current_location=entity,
+            route=None,
+            debug={"resolution": "orb_landmark", **match.debug},
         )
 
     def resolve(

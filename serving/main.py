@@ -31,6 +31,8 @@ class StreamDetection(BaseModel):
     y: float = Field(description="Normalised bottom edge in Vision coords (0–1, bottom origin)")
     width: float = Field(description="Normalised width")
     height: float = Field(description="Normalised height")
+    is_landmark_match: bool = False
+    landmark_name: Optional[str] = None
 
 
 class StreamFrame(BaseModel):
@@ -76,7 +78,29 @@ def _load_detector_for_facility(facility_id: str) -> Detector:
         raise HTTPException(status_code=404, detail=str(e))
 
 
-app = FastAPI(title="AAU Indoor Vision Service", version="0.1.0")
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    skip = os.getenv("SKIP_MODEL_BOOTSTRAP", "").strip().lower() in (
+        "true", "1", "yes", "on"
+    )
+    if not skip:
+        try:
+            from serving.bootstrap_models import ensure_server_model
+            result = ensure_server_model()
+            print(f"[lifespan] model bootstrap: {result}", flush=True)
+        except Exception as exc:
+            print(f"[lifespan] model bootstrap failed: {exc}", flush=True)
+    yield
+
+
+app = FastAPI(
+    title="AAU Indoor Vision Service",
+    version="0.1.0",
+    lifespan=_lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,15 +118,53 @@ def health() -> Dict[str, str]:
 
 def _process_stream_frame(facility_id: str, image_bytes: bytes) -> dict:
     """Run inference + location resolution on a single frame. Runs in thread pool."""
-    try:
-        detector = _get_detector(facility_id)
-    except FileNotFoundError as exc:
-        return {"error": str(exc), "detections": [], "location": LocationEntity(kind="unknown", id="unknown", name="unknown").model_dump()}
-
-    detections_raw, _ = detector.infer(image_bytes)
+    orb_result = _resolver.resolve_from_image_bytes(
+        facility_id=facility_id, image_bytes=image_bytes
+    )
+    if orb_result is not None:
+        loc = orb_result.current_location
+        return {
+            "detections": [{
+                "label": "landmark",
+                "confidence": loc.confidence,
+                "x": 0.20, "y": 0.20, "width": 0.60, "height": 0.60,
+                "is_landmark_match": True,
+                "landmark_name": loc.name,
+            }],
+            "location": loc.model_dump(),
+        }
 
     img = Image.open(BytesIO(image_bytes))
     orig_w, orig_h = img.size
+
+    fake_mode = os.getenv("LANDMARKS_FAKE_DETECTION", "").strip().lower() in (
+        "true", "1", "yes", "on"
+    )
+    if fake_mode:
+        detections_raw = [
+            Detection(
+                label="landmark",
+                confidence=0.99,
+                bbox_xyxy=(
+                    orig_w * 0.30,
+                    orig_h * 0.30,
+                    orig_w * 0.70,
+                    orig_h * 0.70,
+                ),
+            )
+        ]
+    else:
+        try:
+            detector = _get_detector(facility_id)
+        except FileNotFoundError as exc:
+            return {
+                "error": str(exc),
+                "detections": [],
+                "location": LocationEntity(
+                    kind="unknown", id="unknown", name="unknown"
+                ).model_dump(),
+            }
+        detections_raw, _ = detector.infer(image_bytes)
 
     stream_detections = []
     for d in detections_raw:
@@ -113,12 +175,25 @@ def _process_stream_frame(facility_id: str, image_bytes: bytes) -> dict:
             "label": d.label,
             "confidence": round(d.confidence, 3),
             "x": round(x1_n, 4),
-            "y": round(1.0 - y2_n, 4),          
+            "y": round(1.0 - y2_n, 4),
             "width": round((x2 - x1) / orig_w, 4),
             "height": round((y2 - y1) / orig_h, 4),
+            "is_landmark_match": False,
+            "landmark_name": None,
         })
 
     resolved = _resolver.resolve(facility_id=facility_id, detections=detections_raw)
+
+    match = _resolver.landmark_store.find_match(
+        facility_id=facility_id, detections=detections_raw
+    )
+    if match is not None:
+        landmark_name = resolved.current_location.name
+        for idx in match.supporting_indices:
+            if 0 <= idx < len(stream_detections):
+                stream_detections[idx]["is_landmark_match"] = True
+                stream_detections[idx]["landmark_name"] = landmark_name
+
     return {
         "detections": stream_detections,
         "location": resolved.current_location.model_dump(),
@@ -134,6 +209,16 @@ async def stream_vision(websocket: WebSocket, facility_id: str):
       { detections: [...], location: {...} }
     """
     await websocket.accept()
+    try:
+        _resolver.orb_matcher.invalidate(facility_id)
+        loaded = _resolver.orb_matcher.entries_for(facility_id)
+        print(
+            f"[stream_vision:{facility_id}] WS opened — "
+            f"refreshed ORB cache: {len(loaded)} landmark(s)",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[stream_vision:{facility_id}] cache refresh failed: {exc}", flush=True)
     loop = asyncio.get_event_loop()
     try:
         while True:
@@ -148,6 +233,60 @@ async def stream_vision(websocket: WebSocket, facility_id: str):
         pass
     except Exception as exc:
         print(f"[stream_vision:{facility_id}] error: {exc}")
+
+
+@app.get("/v1/landmarks/{facility_id}")
+def list_facility_landmarks(facility_id: str, refresh: bool = False) -> Dict[str, Any]:
+    """Inspect the ORB matcher's cached landmarks for a facility."""
+    if refresh:
+        _resolver.orb_matcher.invalidate(facility_id)
+    entries = _resolver.orb_matcher.entries_for(facility_id)
+    return {
+        "facility_id": facility_id,
+        "count": len(entries),
+        "min_good_matches": int(os.getenv("ORB_MIN_GOOD_MATCHES", "8")),
+        "landmarks": [
+            {
+                "id": e.id,
+                "name": e.name,
+                "space_id": e.space_id,
+                "building_id": e.building_id,
+                "campus_id": e.campus_id,
+                "keypoint_count": e.keypoint_count,
+            }
+            for e in entries
+        ],
+        "note": (
+            "Empty list means the matcher hasn't found any Landmark "
+            "nodes for this facility. Check that the campus_id on "
+            "the registered landmark matches the WS facility_id."
+        ) if not entries else None,
+    }
+
+
+@app.get("/v1/models/{facility_id}/classes")
+def list_model_classes(facility_id: str) -> Dict[str, Any]:
+    """Inspect the class vocabulary the loaded ONNX model actually
+    emits."""
+    try:
+        detector = _get_detector(facility_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    names = detector._class_names or []
+    return {
+        "facility_id": facility_id,
+        "effective_facility": detector._effective_facility,
+        "onnx_path": detector.onnx_path,
+        "metadata_path": detector._metadata_path,
+        "class_count": len(names),
+        "class_names": names,
+        "note": (
+            "Empty class_names means detections will be reported as "
+            "numeric class IDs. Set MODEL_CLASS_NAMES env var or edit "
+            "metadata.json to populate them."
+        ) if not names else None,
+    }
 
 
 @app.get("/v1/models/{facility_id}")

@@ -48,11 +48,12 @@ def _letterbox(
     pad_right = pad_w - pad_left
     pad_bottom = pad_h - pad_top
 
+    pad_value = color[0] if isinstance(color, (tuple, list)) else color
     padded = np.pad(
         resized_np,
         ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
         mode="constant",
-        constant_values=color,
+        constant_values=pad_value,
     )
 
     return padded, r, (pad_left, pad_top)
@@ -214,10 +215,22 @@ class Detector:
         self.model_dir = model_dir
 
         self._onnx_path = os.path.join(model_dir, facility_id, "yolo26_indoor.onnx")
+        self._effective_facility = facility_id
         if not os.path.exists(self._onnx_path):
-            raise FileNotFoundError(f"ONNX model not found: {self._onnx_path}")
+            fallback = os.getenv("MODEL_FALLBACK_FACILITY_ID", "default_facility")
+            fallback_path = os.path.join(model_dir, fallback, "yolo26_indoor.onnx")
+            if fallback and fallback != facility_id and os.path.exists(fallback_path):
+                print(
+                    f"[detector] facility={facility_id!r} has no ONNX; "
+                    f"falling back to facility={fallback!r}",
+                    flush=True,
+                )
+                self._onnx_path = fallback_path
+                self._effective_facility = fallback
+            else:
+                raise FileNotFoundError(f"ONNX model not found: {self._onnx_path}")
 
-        self._metadata_path = os.path.join(model_dir, facility_id, "metadata.json")
+        self._metadata_path = os.path.join(model_dir, self._effective_facility, "metadata.json")
         self._class_names: Optional[List[str]] = None
         if os.path.exists(self._metadata_path):
             try:
