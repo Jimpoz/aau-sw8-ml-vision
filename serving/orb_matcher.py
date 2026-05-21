@@ -32,6 +32,9 @@ _MIN_INLIERS = _env_int("ORB_MIN_INLIERS", 12)
 
 _RANSAC_REPROJ_PX = _env_float("ORB_RANSAC_REPROJ_PX", 5.0)
 
+_GLOBAL_FALLBACK = (os.getenv("ORB_GLOBAL_FALLBACK", "true").strip().lower()
+                    in ("1", "true", "yes", "on"))
+
 
 def _try_import_cv2():
     try:
@@ -59,22 +62,31 @@ class Neo4jLandmarkSource:
     def __init__(self, driver: Any) -> None:
         self._driver = driver
 
+    _RETURN = (
+        "RETURN l.id           AS id, "
+        "       l.name         AS name, "
+        "       l.space_id     AS space_id, "
+        "       l.building_id  AS building_id, "
+        "       l.campus_id    AS campus_id, "
+        "       l.image_b64    AS image_b64, "
+        "       l.image_width  AS image_width, "
+        "       l.image_height AS image_height"
+    )
+
     def fetch(self, facility_id: str) -> List[Dict[str, Any]]:
         if self._driver is None:
             return []
-        cypher = (
-            "MATCH (l:Landmark {campus_id: $campus_id}) "
-            "RETURN l.id           AS id, "
-            "       l.name         AS name, "
-            "       l.space_id     AS space_id, "
-            "       l.building_id  AS building_id, "
-            "       l.campus_id    AS campus_id, "
-            "       l.image_b64    AS image_b64, "
-            "       l.image_width  AS image_width, "
-            "       l.image_height AS image_height"
-        )
+        cypher = "MATCH (l:Landmark {campus_id: $campus_id}) " + self._RETURN
         with self._driver.session() as session:
             rows = session.run(cypher, campus_id=facility_id)
+            return [dict(r) for r in rows]
+
+    def fetch_all(self) -> List[Dict[str, Any]]:
+        if self._driver is None:
+            return []
+        cypher = "MATCH (l:Landmark) " + self._RETURN
+        with self._driver.session() as session:
+            rows = session.run(cypher)
             return [dict(r) for r in rows]
 
 
@@ -126,6 +138,35 @@ class PostgresLandmarkSource:
                 except Exception:
                     pass
 
+    def fetch_all(self) -> List[Dict[str, Any]]:
+        if not self._dsn:
+            return []
+        try:
+            import psycopg2  # type: ignore
+            import psycopg2.extras  # type: ignore
+        except ImportError:
+            return []
+        conn = None
+        try:
+            conn = psycopg2.connect(self._dsn, connect_timeout=5)
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SET app.is_service = 'true'")
+                cur.execute(
+                    "SELECT id, name, space_id, building_id, campus_id, "
+                    "       image_b64, image_width, image_height "
+                    "FROM landmarks"
+                )
+                return [dict(r) for r in cur.fetchall()]
+        except Exception as exc:
+            print(f"[orb_matcher] PostGIS fallback fetch_all failed: {exc}", flush=True)
+            return []
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
 
 class FallbackLandmarkSource:
     """Tries each wrapped source in order and returns the first
@@ -142,6 +183,23 @@ class FallbackLandmarkSource:
                 print(
                     f"[orb_matcher] source {type(source).__name__} "
                     f"raised for {facility_id!r}: {exc}",
+                    flush=True,
+                )
+                continue
+            if records:
+                return records
+        return []
+
+    def fetch_all(self) -> List[Dict[str, Any]]:
+        for source in self._sources:
+            if not hasattr(source, "fetch_all"):
+                continue
+            try:
+                records = source.fetch_all()
+            except Exception as exc:
+                print(
+                    f"[orb_matcher] source {type(source).__name__} "
+                    f"fetch_all raised: {exc}",
                     flush=True,
                 )
                 continue
@@ -204,6 +262,20 @@ class OrbLandmarkMatcher:
         except Exception as exc:
             print(f"[orb_matcher] source.fetch({facility_id!r}) failed: {exc}", flush=True)
             return []
+
+        if not records and _GLOBAL_FALLBACK and hasattr(self._source, "fetch_all"):
+            try:
+                records = self._source.fetch_all()
+            except Exception as exc:
+                print(f"[orb_matcher] source.fetch_all() failed: {exc}", flush=True)
+                records = []
+            if records:
+                print(
+                    f"[orb_matcher] facility={facility_id!r}: no facility-scoped "
+                    f"landmarks; falling back to ALL {len(records)} registered "
+                    f"landmark(s)",
+                    flush=True,
+                )
 
         orb = _cv2.ORB_create(nfeatures=_ORB_FEATURES)
         out: List[CachedLandmark] = []
