@@ -27,6 +27,10 @@ class LocationEntity(BaseModel):
     campus_id: Optional[str] = None
     floor_id: Optional[str] = None
     floor_index: Optional[int] = None
+    centroid_x: Optional[float] = None
+    centroid_y: Optional[float] = None
+    centroid_lat: Optional[float] = None
+    centroid_lng: Optional[float] = None
     properties: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -261,6 +265,12 @@ class LocationResolver:
             space_id=lm.space_id,
             building_id=lm.building_id,
             campus_id=lm.campus_id,
+            floor_id=lm.floor_id,
+            floor_index=lm.floor_index,
+            centroid_x=lm.centroid_x,
+            centroid_y=lm.centroid_y,
+            centroid_lat=lm.centroid_lat,
+            centroid_lng=lm.centroid_lng,
             properties={
                 "match_strategy": "orb",
                 "landmark_id": lm.id,

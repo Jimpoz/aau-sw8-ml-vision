@@ -63,14 +63,21 @@ class Neo4jLandmarkSource:
         self._driver = driver
 
     _RETURN = (
+        "OPTIONAL MATCH (f:Floor {id: l.floor_id}) "
         "RETURN l.id           AS id, "
         "       l.name         AS name, "
         "       l.space_id     AS space_id, "
+        "       l.floor_id     AS floor_id, "
+        "       f.floor_index  AS floor_index, "
         "       l.building_id  AS building_id, "
         "       l.campus_id    AS campus_id, "
         "       l.image_b64    AS image_b64, "
         "       l.image_width  AS image_width, "
-        "       l.image_height AS image_height"
+        "       l.image_height AS image_height, "
+        "       l.centroid_x   AS centroid_x, "
+        "       l.centroid_y   AS centroid_y, "
+        "       l.centroid_lat AS centroid_lat, "
+        "       l.centroid_lng AS centroid_lng"
     )
 
     def fetch(self, facility_id: str) -> List[Dict[str, Any]]:
@@ -122,8 +129,9 @@ class PostgresLandmarkSource:
                 # Satisfy the org-isolation RLS policy as a service read.
                 cur.execute("SET app.is_service = 'true'")
                 cur.execute(
-                    "SELECT id, name, space_id, building_id, campus_id, "
-                    "       image_b64, image_width, image_height "
+                    "SELECT id, name, space_id, floor_id, building_id, campus_id, "
+                    "       image_b64, image_width, image_height, "
+                    "       centroid_x, centroid_y, centroid_lat, centroid_lng "
                     "FROM landmarks WHERE campus_id = %s",
                     (facility_id,),
                 )
@@ -152,8 +160,9 @@ class PostgresLandmarkSource:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("SET app.is_service = 'true'")
                 cur.execute(
-                    "SELECT id, name, space_id, building_id, campus_id, "
-                    "       image_b64, image_width, image_height "
+                    "SELECT id, name, space_id, floor_id, building_id, campus_id, "
+                    "       image_b64, image_width, image_height, "
+                    "       centroid_x, centroid_y, centroid_lat, centroid_lng "
                     "FROM landmarks"
                 )
                 return [dict(r) for r in cur.fetchall()]
@@ -220,6 +229,12 @@ class CachedLandmark:
     descriptors: Any  # numpy.ndarray
     keypoint_count: int
     keypoints: Any = None  # numpy.ndarray (N, 2)
+    floor_id: Optional[str] = None
+    floor_index: Optional[int] = None
+    centroid_x: Optional[float] = None
+    centroid_y: Optional[float] = None
+    centroid_lat: Optional[float] = None
+    centroid_lng: Optional[float] = None
 
 
 @dataclass
@@ -300,6 +315,15 @@ class OrbLandmarkMatcher:
                 continue
 
             ref_pts = _np.float32([kp.pt for kp in keypoints]) if keypoints else None
+
+            def _as_float(v: Any) -> Optional[float]:
+                if v is None:
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+
             out.append(CachedLandmark(
                 id=str(record["id"]),
                 name=str(record.get("name") or record["id"]),
@@ -309,6 +333,12 @@ class OrbLandmarkMatcher:
                 descriptors=descriptors,
                 keypoint_count=len(keypoints),
                 keypoints=ref_pts,
+                floor_id=record.get("floor_id"),
+                floor_index=record.get("floor_index"),
+                centroid_x=_as_float(record.get("centroid_x")),
+                centroid_y=_as_float(record.get("centroid_y")),
+                centroid_lat=_as_float(record.get("centroid_lat")),
+                centroid_lng=_as_float(record.get("centroid_lng")),
             ))
 
         print(
